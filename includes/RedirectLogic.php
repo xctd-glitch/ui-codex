@@ -6,13 +6,20 @@ class RedirectLogic {
     private $country;
     private $deviceType;
     private $isVPN;
-    
+    private $routingConfig;
+    private $countryWhitelist;
+    private $domainSelection;
+
     public function __construct($pdo, $userId, $country, $deviceType, $isVPN) {
         $this->pdo = $pdo;
         $this->userId = $userId;
         $this->country = $country;
         $this->deviceType = $deviceType;
         $this->isVPN = $isVPN;
+
+        $this->routingConfig = $this->loadRoutingConfig();
+        $this->countryWhitelist = $this->loadCountryWhitelist();
+        $this->domainSelection = $this->loadDomainSelection();
     }
     
     public function decide() {
@@ -127,47 +134,25 @@ class RedirectLogic {
     }
     
     private function passesFilters() {
-        $stmt = $this->pdo->prepare("SELECT device_scope FROM user_routing_config WHERE user_id = ?");
-        $stmt->execute([$this->userId]);
-        $config = $stmt->fetch();
-        
-        if ($config) {
-            $deviceScope = $config['device_scope'];
-            if ($deviceScope !== 'ALL') {
-                if ($deviceScope !== $this->deviceType) {
-                    return false;
-                }
+        $deviceScope = $this->routingConfig['device_scope'] ?? 'ALL';
+        if ($deviceScope !== 'ALL' && $deviceScope !== $this->deviceType) {
+            return false;
+        }
+
+        if (!empty($this->countryWhitelist)) {
+            if (empty($this->country)) {
+                return false;
+            }
+
+            if (!in_array($this->country, $this->countryWhitelist)) {
+                return false;
             }
         }
-        
-        if ($this->country) {
-            $stmt = $this->pdo->prepare("SELECT COUNT(*) as count FROM user_countries WHERE user_id = ?");
-            $stmt->execute([$this->userId]);
-            $result = $stmt->fetch();
-            
-            if ($result['count'] > 0) {
-                $stmt = $this->pdo->prepare("SELECT COUNT(*) as count FROM user_countries WHERE user_id = ? AND iso_code = ?");
-                $stmt->execute([$this->userId, $this->country]);
-                $countryMatch = $stmt->fetch();
-                
-                if ($countryMatch['count'] == 0) {
-                    return false;
-                }
-            }
-        }
-        
+
         return true;
     }
     
     private function getTargetForUser() {
-        $stmt = $this->pdo->prepare("SELECT selection_type, specific_domain FROM user_domain_selection WHERE user_id = ?");
-        $stmt->execute([$this->userId]);
-        $selection = $stmt->fetch();
-        
-        if (!$selection) {
-            $selection = ['selection_type' => 'random_user', 'specific_domain' => null];
-        }
-        
         $stmt = $this->pdo->prepare("SELECT url FROM user_target_urls WHERE user_id = ? ORDER BY RAND() LIMIT 1");
         $stmt->execute([$this->userId]);
         $targetUrl = $stmt->fetch();
@@ -178,22 +163,16 @@ class RedirectLogic {
         
         return $this->replaceDomainPlaceholder($targetUrl['url']);
     }
-    
+
     private function replaceDomainPlaceholder($url) {
         if (strpos($url, '{domain}') === false) {
             return $url;
         }
-        
-        $stmt = $this->pdo->prepare("SELECT selection_type, specific_domain FROM user_domain_selection WHERE user_id = ?");
-        $stmt->execute([$this->userId]);
-        $selection = $stmt->fetch();
-        
-        if (!$selection) {
-            $selection = ['selection_type' => 'random_user', 'specific_domain' => null];
-        }
-        
+
+        $selection = $this->domainSelection;
+
         $domain = null;
-        
+
         switch ($selection['selection_type']) {
             case 'specific':
                 $domain = $selection['specific_domain'];
@@ -229,5 +208,37 @@ class RedirectLogic {
         }
         
         return $url;
+    }
+
+    private function loadRoutingConfig() {
+        $stmt = $this->pdo->prepare("SELECT device_scope FROM user_routing_config WHERE user_id = ?");
+        $stmt->execute([$this->userId]);
+        return $stmt->fetch() ?: [];
+    }
+
+    private function loadCountryWhitelist() {
+        $stmt = $this->pdo->prepare("SELECT iso_code FROM user_countries WHERE user_id = ?");
+        $stmt->execute([$this->userId]);
+        $countries = $stmt->fetchAll();
+
+        if (empty($countries)) {
+            return [];
+        }
+
+        return array_map(function ($row) {
+            return strtoupper($row['iso_code']);
+        }, $countries);
+    }
+
+    private function loadDomainSelection() {
+        $stmt = $this->pdo->prepare("SELECT selection_type, specific_domain FROM user_domain_selection WHERE user_id = ?");
+        $stmt->execute([$this->userId]);
+        $selection = $stmt->fetch();
+
+        if (!$selection) {
+            return ['selection_type' => 'random_user', 'specific_domain' => null];
+        }
+
+        return $selection;
     }
 }
